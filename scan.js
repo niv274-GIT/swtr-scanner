@@ -194,14 +194,34 @@ function scoreCandidate(ticker, highs, lows, closes) {
   const breaks = countBreaks(closes, support, resistance);
   const breakRate = breaks/closes.length*100;
 
-  let score = r.score * 0.4;
+  // ── De-saturated, width-aware scoring (0-100) ──────────────────────────────
+  // The detector already gated RANGING above; this score RANKS the survivors by
+  // how tradeable the range is, so the best genuinely separate from the good.
   const totalTouches = sT + rT;
-  if (totalTouches >= 6) score += 25; else if (totalTouches >= 4) score += 15; else score += 5;
-  if (clean >= 60) score += 20; else if (clean >= 40) score += 12;
-  if (breakRate <= 3) score += 15; else if (breakRate <= 8) score += 5; else score -= 10;
+  const balanced = sT >= 3 && rT >= 3;
+
+  // Touch quality (0-30): more touches = better-tested range; saturates ~16.
+  let score = Math.min(26, totalTouches * 1.7) + (balanced ? 4 : 0);
+  // Cleanliness (0-25): share of time price respected the band, continuous.
+  score += (clean / 100) * 25;
+  // Break discipline (0-25): 0% breaks = 25, decays fast.
+  score += Math.max(0, 25 - breakRate * 5);
+  // Range-width fitness (0-20): peaked on tradeable widths (~10-20%).
+  let widthFit;
+  if      (rangePct >= 10 && rangePct <= 20) widthFit = 20;
+  else if (rangePct >=  8 && rangePct <  10) widthFit = 13;
+  else if (rangePct >  20 && rangePct <= 24) widthFit = 13;
+  else if (rangePct >  24 && rangePct <= 28) widthFit = 6;
+  else                                        widthFit = 0;   // <8% too tight, >28% too wide / volatile
+  score += widthFit;
   score = Math.max(0, Math.min(100, score));
 
-  const isCandidate = score >= 60 && totalTouches >= 4 && breakRate <= 8;
+  // Tighter gate: tradeable width, well-tested, disciplined, quality score.
+  const isCandidate =
+    rangePct >= 8 && rangePct <= 28 &&
+    totalTouches >= 6 &&
+    breakRate <= 5 &&
+    score >= 70;
   return {
     ticker, isCandidate, score: Math.round(score), verdict:r.verdict,
     support: +support.toFixed(2), resistance: +resistance.toFixed(2),
