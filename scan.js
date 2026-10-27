@@ -174,12 +174,54 @@ function bandCleanliness(closes, support, resistance) {
   return Math.min(100, (edgeTime*70 + balance*30) * 1.4);
 }
 
-function countBreaks(closes, support, resistance) {
-  const below = support*0.95, above = resistance*1.05;
-  return closes.filter(c => c<=below || c>=above).length;
+// ATR — identical to computeATR in the app's src/api/rangeAnalyzer.ts:
+// 14-day simple average true range, clamped to 2–7.5% of the last close.
+function computeATR(highs, lows, closes) {
+  const trs = [];
+  for (let i = 1; i < closes.length; i++) {
+    trs.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1])));
+  }
+  const price = closes[closes.length-1];
+  const raw = trs.slice(-14).reduce((a,b)=>a+b,0) / Math.min(14, trs.length);
+  return Math.max(price*0.02, Math.min(price*0.075, raw));
 }
 
-function scoreCandidate(ticker, highs, lows, closes) {
+// Breaks counted the way the stop works: intraday low < support − 1×ATR.
+// Once per episode — a break ends only when a close gets back above support.
+function countBreaks(lows, closes, support, atr) {
+  const stop = support - atr;
+  let breaks = 0, broken = false;
+  for (let i = 0; i < lows.length; i++) {
+    if (!broken && lows[i] < stop) { breaks++; broken = true; }
+    else if (broken && closes[i] >= support) broken = false;
+  }
+  return breaks;
+}
+
+// Default-trade replay — same logic as backtestCombo in the app's
+// src/api/rangeAnalyzer.ts (fill when the bar spans entry, stop checked first,
+// an open trade at the end is not counted).
+function replayDefaultTrade(highs, lows, support, resistance, atr) {
+  const range = resistance - support;
+  const entry = support + 0.15*range, target = resistance - 0.10*range, stop = support - atr;
+  let wins = 0, losses = 0, inTrade = false;
+  for (let i = 0; i < highs.length; i++) {
+    const hi = highs[i], lo = lows[i];
+    if (!inTrade) {
+      if (lo <= entry && entry <= hi) inTrade = true;
+    } else if (lo <= stop) { losses++; inTrade = false; }
+    else if (hi >= target) { wins++; inTrade = false; }
+  }
+  const trades = wins + losses;
+  return { trades, wins, losses, hitRate: trades ? wins/trades*100 : 0 };
+}
+
+const DETECT_BARS = 180;   // level detection window; the replay uses every fetched bar
+
+function scoreCandidate(ticker, allHighs, allLows, allCloses) {
+  const highs  = allHighs.slice(-DETECT_BARS);
+  const lows   = allLows.slice(-DETECT_BARS);
+  const closes = allCloses.slice(-DETECT_BARS);
   const r = detectRanging(highs, lows, closes);
   if (r.verdict !== 'RANGING') {
     return { ticker, isCandidate:false, score:r.score, verdict:r.verdict, support:null, resistance:null };
@@ -191,8 +233,12 @@ function scoreCandidate(ticker, highs, lows, closes) {
   const rangePct = (resistance-support)/support*100;
   const sT = countTouches(lows, support), rT = countTouches(highs, resistance);
   const clean = bandCleanliness(closes, support, resistance);
-  const breaks = countBreaks(closes, support, resistance);
-  const breakRate = breaks/closes.length*100;
+  const atr = computeATR(highs, lows, closes);
+  const breaks = countBreaks(lows, closes, support, atr);
+  // Breaks per test of support (a break is itself a test).
+  const supportTests = Math.max(sT, breaks);
+  const breakRate = supportTests ? breaks/supportTests*100 : 0;
+  const replay = replayDefaultTrade(allHighs, allLows, support, resistance, atr);
 
   // ── De-saturated, width-aware scoring (0-100) ──────────────────────────────
   // The detector already gated RANGING above; this score RANKS the survivors by
@@ -204,8 +250,8 @@ function scoreCandidate(ticker, highs, lows, closes) {
   let score = Math.min(26, totalTouches * 1.7) + (balanced ? 4 : 0);
   // Cleanliness (0-25): share of time price respected the band, continuous.
   score += (clean / 100) * 25;
-  // Break discipline (0-25): 0% breaks = 25, decays fast.
-  score += Math.max(0, 25 - breakRate * 5);
+  // Break discipline (0-25): 0% breaks = 25, 20% of tests broken = 0.
+  score += Math.max(0, 25 - breakRate * 1.25);
   // Range-width fitness (0-20): peaked on tradeable widths (~10-20%).
   let widthFit;
   if      (rangePct >= 10 && rangePct <= 20) widthFit = 20;
@@ -216,17 +262,22 @@ function scoreCandidate(ticker, highs, lows, closes) {
   score += widthFit;
   score = Math.max(0, Math.min(100, score));
 
-  // Tighter gate: tradeable width, well-tested, disciplined, quality score.
+  // Tighter gate: tradeable width, well-tested, disciplined, quality score,
+  // and the default trade actually worked on the full history.
   const isCandidate =
     rangePct >= 8 && rangePct <= 28 &&
     totalTouches >= 6 &&
-    breakRate <= 5 &&
-    score >= 70;
+    breakRate <= 20 &&
+    score >= 70 &&
+    replay.trades >= 4 && replay.hitRate >= 60;
   return {
     ticker, isCandidate, score: Math.round(score), verdict:r.verdict,
     support: +support.toFixed(2), resistance: +resistance.toFixed(2),
     rangePct: +rangePct.toFixed(1), supportTouches:sT, resistTouches:rT,
     bandClean: Math.round(clean), breakCount:breaks, breakRate: +breakRate.toFixed(0),
+    atr: +atr.toFixed(2),
+    replayTrades: replay.trades, replayWins: replay.wins, replayLosses: replay.losses,
+    replayHitRate: Math.round(replay.hitRate),
   };
 }
 
@@ -244,9 +295,10 @@ function parseCandles(block) {
 }
 
 // Fetch a BATCH of up to ~50 symbols in one call. Returns { SYMBOL: candles }.
+// 500 bars costs the same credits as 180; detection uses the last 180, the replay all 500.
 async function fetchBatch(tickers, apiKey) {
   const symbolParam = tickers.join(',');
-  const url = `https://api.twelvedata.com/time_series?symbol=${symbolParam}&interval=1day&outputsize=180&apikey=${apiKey}`;
+  const url = `https://api.twelvedata.com/time_series?symbol=${symbolParam}&interval=1day&outputsize=500&apikey=${apiKey}`;
   const res = await fetch(url);
   if (!res.ok) { console.log(`  HTTP ${res.status} on batch [${symbolParam}]`); return {}; }
   const d = await res.json();
@@ -286,7 +338,7 @@ async function sendPush(result) {
   } else {
     const lines = top.map(c => {
       const star = c.score >= 75 ? '⭐' : '·';
-      return `${star} ${c.ticker}  $${c.support}–$${c.resistance} (${c.rangePct}%)  score ${c.score} · ${c.supportTouches}+${c.resistTouches} touches · ${c.breakRate}% brk`;
+      return `${star} ${c.ticker}  $${c.support}–$${c.resistance} (${c.rangePct}%)  quality ${c.score} · ${c.replayWins}W/${c.replayLosses}L · ${c.breakRate}% brk`;
     });
     body = `${totalCandidates} range candidates found. Top ${top.length} for validation:\n\n${lines.join('\n')}\n\nHand-validate before adding to watchlist.`;
   }
